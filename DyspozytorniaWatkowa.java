@@ -10,7 +10,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public class DyspozytorniaWatkowa implements Dyspozytornia {
     private final AtomicInteger zlecenieId = new AtomicInteger(1);
 
-    //zlecenia
+    //zlecenia -> ta kolejka ma wewnętrzny RenstrantLock
     Comparator<Zlecenie> zlecenieComparator = Comparator
             .comparing(Zlecenie::priority).reversed()
             .thenComparing(Zlecenie::createdAt);
@@ -40,7 +40,9 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         Zlecenie zlecenie = new Zlecenie(id, 0, System.currentTimeMillis());
         zlecenieQueue.offer(zlecenie);
 
-        //todo: budzimy wątki które sa uśpione bo czekały na zlecenia nowe
+        for (TaxiThread taxi : taxiMap.values()) {
+            taxi.notifyWorkersWithNewZlecenie();
+        }
 
         return id;
     }
@@ -58,7 +60,9 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
                 zlecenieQueue.offer(zlecenie);
                 brokenTaxiId = numer;
 
-                //todo: budzimy wątki czekające na zadania -> a ten thread pobranu tutaj powinien się sam zatrzymać
+                for (TaxiThread taxi : taxiMap.values()) {
+                    taxi.notifyWorkersWithNewZlecenie();
+                }
             }
         } else {
             throw new RuntimeException("Taxi thread not found");
@@ -91,13 +95,17 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         });
         return resztaPracy;
     }
+
+    public boolean isShuttingDownDyspozytornia(){
+        return shuttingDownDyspozytornia;
+    }
 }
 
 
 class TaxiThread implements Runnable {
     private final Taxi taxi;
     private final PriorityBlockingQueue<Zlecenie> zlecenieQueue;
-    private final Dyspozytornia dyspozytornia;
+    private final DyspozytorniaWatkowa dyspozytornia;
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition awariaQueue = lock.newCondition();
@@ -115,9 +123,50 @@ class TaxiThread implements Runnable {
 
     @Override
     public void run() {
+        while (!stopped || !dyspozytornia.isShuttingDownDyspozytornia()) {
+            Zlecenie zlecenie = null;
+
+            lock.lock();
+            try {
+                while (state == TaxiState.BROKEN && !stopped && !dyspozytornia.isShuttingDownDyspozytornia()) {
+                    awariaQueue.await();
+                }
+
+                if (stopped || dyspozytornia.isShuttingDownDyspozytornia()) break;
+
+                while (state == TaxiState.WAITING && (state != TaxiState.BROKEN || state != TaxiState.RUNNING) &&
+                                !stopped && !dyspozytornia.isShuttingDownDyspozytornia()) {
+                    zlecenie = zlecenieQueue.poll();
+                    if (zlecenie == null) {
+                        state = TaxiState.RUNNING;
+                        break;
+                    }
+                    noweZlecenieQueue.await(); //jak nie ma zlecenia to czekaj
+                }
+
+                if (stopped || dyspozytornia.isShuttingDownDyspozytornia()) break;
+
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }finally {
+                lock.unlock();
+            }
+
+            //todo: robienie zlecenia
+
+        }
 
 
+    }
 
+    void notifyWorkersWithNewZlecenie(){
+        lock.lock();
+        try {
+            noweZlecenieQueue.signal();
+        } finally {
+            lock.unlock();
+        }
     }
 
     void markTaxiAsBroken() {

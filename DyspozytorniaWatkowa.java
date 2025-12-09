@@ -79,8 +79,6 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         } else {
             throw new RuntimeException("Taxi thread not found");
         }
-
-
     }
 
     @Override
@@ -100,7 +98,6 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         return shuttingDownDyspozytornia;
     }
 }
-
 
 class TaxiThread implements Runnable {
     private final Taxi taxi;
@@ -134,14 +131,13 @@ class TaxiThread implements Runnable {
 
                 if (stopped || dyspozytornia.isShuttingDownDyspozytornia()) break;
 
-                while (state == TaxiState.WAITING && (state != TaxiState.BROKEN || state != TaxiState.RUNNING) &&
-                                !stopped && !dyspozytornia.isShuttingDownDyspozytornia()) {
+                while (state == TaxiState.WAITING && !stopped && !dyspozytornia.isShuttingDownDyspozytornia()) {
                     zlecenie = zlecenieQueue.poll();
-                    if (zlecenie == null) {
-                        state = TaxiState.RUNNING;
+                    if (zlecenie != null) {
+                        markTaxiAsRunning();
                         break;
                     }
-                    noweZlecenieQueue.await(); //jak nie ma zlecenia to czekaj
+                    noweZlecenieQueue.await(); //kolejka pusta -> czekamy dalej
                 }
 
                 if (stopped || dyspozytornia.isShuttingDownDyspozytornia()) break;
@@ -153,11 +149,21 @@ class TaxiThread implements Runnable {
                 lock.unlock();
             }
 
-            //todo: robienie zlecenia
-
+            if (zlecenie != null) {
+                try {
+                    taxi.wykonajZlecenie(zlecenie.id());
+                } finally {
+                    try {
+                        lock.lock();
+                        if (state != TaxiState.BROKEN) {
+                            state = TaxiState.WAITING;
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                }
+            }
         }
-
-
     }
 
     void notifyWorkersWithNewZlecenie(){
@@ -188,12 +194,7 @@ class TaxiThread implements Runnable {
     }
 
     void markTaxiAsRunning() {
-        lock.lock();
-        try {
-            state = TaxiState.RUNNING;
-        } finally {
-            lock.unlock();
-        }
+        state = TaxiState.RUNNING;
     }
 
     void stop() {

@@ -83,6 +83,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
 
     @Override
     public Set<Integer> koniecPracy() {
+        shuttingDownDyspozytornia = true;
         for (TaxiThread taxiThread : taxiMap.values()) {
             taxiThread.stop();
         }
@@ -120,7 +121,7 @@ class TaxiThread implements Runnable {
 
     @Override
     public void run() {
-        while (!stopped || !dyspozytornia.isShuttingDownDyspozytornia()) {
+        while (!stopped && !dyspozytornia.isShuttingDownDyspozytornia()) {
             Zlecenie zlecenie = null;
 
             lock.lock();
@@ -155,7 +156,7 @@ class TaxiThread implements Runnable {
                 } finally {
                     try {
                         lock.lock();
-                        if (state != TaxiState.BROKEN) {
+                        if (state != TaxiState.BROKEN && state == TaxiState.RUNNING) {
                             state = TaxiState.WAITING;
                         }
                     } finally {
@@ -188,6 +189,7 @@ class TaxiThread implements Runnable {
         lock.lock();
         try {
             state = TaxiState.WAITING;
+            awariaQueue.signal();
         } finally {
             lock.unlock();
         }

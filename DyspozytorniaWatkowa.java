@@ -2,13 +2,17 @@ import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
+
 public class DyspozytorniaWatkowa implements Dyspozytornia {
     private final AtomicInteger zlecenieId = new AtomicInteger(1);
+    private final AtomicLong timeAdded = new AtomicLong();
 
     //zlecenia -> ta kolejka ma wewnętrzny RenstrantLock
     Comparator<Zlecenie> zlecenieComparator = Comparator
@@ -19,7 +23,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
     //TAXI
     private final ConcurrentHashMap<Integer, TaxiThread> taxiMap = new ConcurrentHashMap<>();
 
-    private volatile Integer brokenTaxiId = null;
+    private volatile Integer brokenTaxiId = null; // tylko jedno taxi broken, to na wszelki
     private volatile boolean shuttingDownDyspozytornia = false;
 
 
@@ -36,8 +40,11 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
 
     @Override
     public int zlecenie() {
+        if (shuttingDownDyspozytornia) {
+            throw new IllegalStateException("Dyspozytornia is shutting down");
+        }
         int id = zlecenieId.incrementAndGet();
-        Zlecenie zlecenie = new Zlecenie(id, 0, System.currentTimeMillis());
+        Zlecenie zlecenie = new Zlecenie(id, 0, timeAdded.incrementAndGet());
         zlecenieQueue.offer(zlecenie);
 
         for (TaxiThread taxi : taxiMap.values()) {
@@ -56,7 +63,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
             else {
                 taxiThread.markTaxiAsBroken();
 
-                Zlecenie zlecenie = new Zlecenie(numerZlecenia, 1, System.currentTimeMillis());
+                Zlecenie zlecenie = new Zlecenie(numerZlecenia, 1, timeAdded.incrementAndGet());
                 zlecenieQueue.offer(zlecenie);
                 brokenTaxiId = numer;
 
@@ -74,8 +81,10 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         TaxiThread taxiThread = taxiMap.get(numer);
         if (taxiThread != null) {
             if (taxiThread.getState() != TaxiState.BROKEN) throw new RuntimeException("Taxi not broken");
-            else taxiThread.markTaxiAsRepaired();
-
+            else  {
+                taxiThread.markTaxiAsRepaired();
+                brokenTaxiId = null;
+            }
         } else {
             throw new RuntimeException("Taxi thread not found");
         }
@@ -135,6 +144,11 @@ class TaxiThread implements Runnable {
                 while (state == TaxiState.WAITING && !stopped && !dyspozytornia.isShuttingDownDyspozytornia()) {
                     zlecenie = zlecenieQueue.poll();
                     if (zlecenie != null) {
+                        if (state == TaxiState.BROKEN) {
+                            zlecenieQueue.offer(zlecenie);
+                            zlecenie = null;
+                            break;
+                        }
                         markTaxiAsRunning();
                         break;
                     }
@@ -170,7 +184,9 @@ class TaxiThread implements Runnable {
     void notifyWorkersWithNewZlecenie(){
         lock.lock();
         try {
-            noweZlecenieQueue.signal();
+            if (state != TaxiState.BROKEN) {
+                noweZlecenieQueue.signal();
+            }
         } finally {
             lock.unlock();
         }
@@ -190,6 +206,7 @@ class TaxiThread implements Runnable {
         try {
             state = TaxiState.WAITING;
             awariaQueue.signal();
+            noweZlecenieQueue.signal();
         } finally {
             lock.unlock();
         }
@@ -203,8 +220,8 @@ class TaxiThread implements Runnable {
         stopped = true;
         lock.lock();
         try {
-            awariaQueue.signal();
-            noweZlecenieQueue.signal();
+            awariaQueue.signalAll();
+            noweZlecenieQueue.signalAll();
         } finally {
             lock.unlock();
         }
@@ -215,7 +232,6 @@ class TaxiThread implements Runnable {
 
 record Zlecenie(int id, int priority, long createdAt) {}
 enum TaxiState { WAITING, RUNNING, BROKEN }
-
 
 
 

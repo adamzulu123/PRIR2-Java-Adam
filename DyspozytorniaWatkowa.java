@@ -18,9 +18,10 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
             .thenComparing(Zlecenie::createdAt);
     private final PriorityBlockingQueue<Zlecenie> zlecenieQueue = new PriorityBlockingQueue<>(100, zlecenieComparator);
 
-    private final ConcurrentHashMap<Integer, Integer> assignedOrders = new ConcurrentHashMap<>(); //todo: problem z awaria - moze rozwiązać
+    // śledzenie przydzielonych zleceń: Zlecenie ID -> Taxi numer
+    private final ConcurrentHashMap<Integer, Integer> assignedOrders = new ConcurrentHashMap<>();
 
-    // Zarządzanie taksówkami
+    // Taxi
     private final ConcurrentHashMap<Integer, TaxiThread> allTaxis = new ConcurrentHashMap<>();
     private final Set<Integer> availableTaxis = ConcurrentHashMap.newKeySet();
     private final Set<Integer> busyTaxis = ConcurrentHashMap.newKeySet();
@@ -71,15 +72,9 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
             taxiLock.unlock();
         }
 
-        boolean isInTheQueue = false;
-        for (Zlecenie zlecenie : zlecenieQueue) {
-            if (zlecenie.id() == numerZlecenia) {
-                isInTheQueue = true;
-                break;
-            }
-        }
+        Integer wasAssigned = assignedOrders.remove(numerZlecenia);
 
-        if (!isInTheQueue) {
+        if (wasAssigned != null) {
             Zlecenie zlecenie = new Zlecenie(numerZlecenia, 1, timeAdded.incrementAndGet());
             zlecenieQueue.offer(zlecenie);
         }
@@ -126,7 +121,6 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         return shuttingDownDyspozytornia;
     }
 
-    // dyspozytornia przydziela zlecenia taksówkom
     private void tryDispatchZlecenia() {
         if (shuttingDownDyspozytornia) return;
 
@@ -142,6 +136,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
 
                 TaxiThread taxiThread = allTaxis.get(taxiNumer);
                 if (taxiThread != null) {
+                    assignedOrders.put(zlecenie.id(), taxiNumer);
                     taxiThread.assignZlecenie(zlecenie);
                 }
             }
@@ -150,9 +145,10 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         }
     }
 
-    // wątek taksówki wywołuje to wtedy gdy zlecenie jest wykonanane
-    void onTaxiFinished(int taxiNumer) {
+    void onTaxiFinished(int taxiNumer, int zlecenieId) {
         if (shuttingDownDyspozytornia) return;
+
+        assignedOrders.remove(zlecenieId);
 
         taxiLock.lock();
         try {
@@ -174,7 +170,6 @@ class TaxiThread implements Runnable {
     private final DyspozytorniaWatkowa dyspozytornia;
 
     private final ReentrantLock lock = new ReentrantLock();
-
     private final Condition awariaCondition = lock.newCondition();
     private final Condition noweZlecenieCondition = lock.newCondition();
 
@@ -194,18 +189,21 @@ class TaxiThread implements Runnable {
 
             lock.lock();
             try {
+                // czekamy jeśli broken
                 while (state == TaxiState.BROKEN && !dyspozytornia.isShuttingDownDyspozytornia()) {
                     awariaCondition.await();
                 }
 
                 if (dyspozytornia.isShuttingDownDyspozytornia()) break;
 
+                // czekamy na nowe zlecenie
                 while (!hasNewZlecenie && !dyspozytornia.isShuttingDownDyspozytornia()) {
                     noweZlecenieCondition.await();
                 }
 
                 if (dyspozytornia.isShuttingDownDyspozytornia()) break;
 
+                // bierzemy zlecenie
                 if (hasNewZlecenie && currentZlecenie != null) {
                     zlecenieToDo = currentZlecenie;
                     currentZlecenie = null;
@@ -220,15 +218,17 @@ class TaxiThread implements Runnable {
                 lock.unlock();
             }
 
+            // wykonujemy zlecenie po za lock
             if (zlecenieToDo != null) {
+                int executedZlecenieId = zlecenieToDo.id();
                 try {
-                    taxi.wykonajZlecenie(zlecenieToDo.id());
+                    taxi.wykonajZlecenie(executedZlecenieId);
                 } finally {
                     lock.lock();
                     try {
                         if (state != TaxiState.BROKEN && state == TaxiState.RUNNING) {
                             state = TaxiState.WAITING;
-                            dyspozytornia.onTaxiFinished(taxi.numer());
+                            dyspozytornia.onTaxiFinished(taxi.numer(), executedZlecenieId);
                         }
                     } finally {
                         lock.unlock();

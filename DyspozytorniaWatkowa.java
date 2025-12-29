@@ -19,12 +19,16 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
     private final PriorityBlockingQueue<Zlecenie> zlecenieQueue = new PriorityBlockingQueue<>(100, zlecenieComparator);
 
     // śledzenie przydzielonych zleceń: Zlecenie ID -> Taxi numer
-    private final ConcurrentHashMap<Integer, Integer> assignedOrders = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Integer, Integer> assignedOrders = new ConcurrentHashMap<>(); //todo: upewnić się czy to niezbędne
 
     // Taxi
     private final ConcurrentHashMap<Integer, TaxiThread> allTaxis = new ConcurrentHashMap<>();
+    //todo: czy te avaiableTaxis oraz busyTaxis moga być queue?  w ten sposób nie będzie głodzenia wątków (do sprawdzenia)
+    // czy wgl busyTaxis jest potrzebne jak nigdzie tego nie sprawdzamy i tak? tak samo lock, jeśli uzyć BlockingQueue (bo ona ma wbudowany lock)
+    // BlockingQueue<Integer> availableTaxis = new LinkedBlockingQueue<>();
     private final Set<Integer> availableTaxis = ConcurrentHashMap.newKeySet();
     private final Set<Integer> busyTaxis = ConcurrentHashMap.newKeySet();
+
     private final ReentrantLock taxiLock = new ReentrantLock();
 
     private volatile Integer brokenTaxiId = null; // tylko jedno taxi broken, to na wszelki
@@ -51,7 +55,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         Zlecenie zlecenie = new Zlecenie(id, 0, timeAdded.incrementAndGet());
         zlecenieQueue.offer(zlecenie);
 
-        tryDispatchZlecenia();
+        tryReAssignZlecenie();
         return id;
     }
 
@@ -73,13 +77,14 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         }
 
         Integer wasAssigned = assignedOrders.remove(numerZlecenia);
-
-        if (wasAssigned != null) {
+        if (wasAssigned == null) {
+            System.out.println("Zlecenie number: " + numerZlecenia + " wasn't assigned, only taxi will be marked as broken");
+        } else {
             Zlecenie zlecenie = new Zlecenie(numerZlecenia, 1, timeAdded.incrementAndGet());
             zlecenieQueue.offer(zlecenie);
         }
 
-        tryDispatchZlecenia();
+        tryReAssignZlecenie();
     }
 
     @Override
@@ -98,7 +103,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
             taxiLock.unlock();
         }
 
-        tryDispatchZlecenia();
+        tryReAssignZlecenie();
     }
 
     @Override
@@ -121,7 +126,8 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         return shuttingDownDyspozytornia;
     }
 
-    private void tryDispatchZlecenia() {
+    //todo: do zmiany jak tylko BlockingQueue uzyjemy BlockingQueue<Integer> availableTaxis = new LinkedBlockingQueue<>();
+    private void tryReAssignZlecenie() {
         if (shuttingDownDyspozytornia) return;
 
         taxiLock.lock();
@@ -161,7 +167,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
             taxiLock.unlock();
         }
 
-        tryDispatchZlecenia(); // próbujemy przydzielić nowe
+        tryReAssignZlecenie(); // próbujemy przydzielić nowe
     }
 }
 
@@ -174,6 +180,8 @@ class TaxiThread implements Runnable {
     private final Condition noweZlecenieCondition = lock.newCondition();
 
     private volatile TaxiState state = TaxiState.WAITING;
+
+    //todo : sprawdzenie czy to 2 pole jest niezbędne czy da się uprościć
     private volatile Zlecenie currentZlecenie = null;
     private volatile boolean hasNewZlecenie = false;
 

@@ -1,16 +1,15 @@
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 public class DyspozytorniaWatkowa implements Dyspozytornia {
     private final AtomicInteger zlecenieId = new AtomicInteger(0);
-    private final AtomicLong timeAdded = new AtomicLong();
 
     //zlecenia -> ta kolejka ma wewnętrzny RenstrantLock
     Comparator<Zlecenie> zlecenieComparator = Comparator
@@ -19,19 +18,14 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
     private final PriorityBlockingQueue<Zlecenie> zlecenieQueue = new PriorityBlockingQueue<>(100, zlecenieComparator);
 
     // śledzenie przydzielonych zleceń: Zlecenie ID -> Taxi numer
-    private final ConcurrentHashMap<Integer, Integer> assignedOrders = new ConcurrentHashMap<>(); //todo: upewnić się czy to niezbędne
+    private final ConcurrentHashMap<Integer, Integer> assignedOrders = new ConcurrentHashMap<>();
 
     // Taxi
     private final ConcurrentHashMap<Integer, TaxiThread> allTaxis = new ConcurrentHashMap<>();
-    //todo: czy te avaiableTaxis oraz busyTaxis moga być queue?  w ten sposób nie będzie głodzenia wątków (do sprawdzenia)
-    // czy wgl busyTaxis jest potrzebne jak nigdzie tego nie sprawdzamy i tak? tak samo lock, jeśli uzyć BlockingQueue (bo ona ma wbudowany lock)
-    // BlockingQueue<Integer> availableTaxis = new LinkedBlockingQueue<>();
     private final Set<Integer> availableTaxis = ConcurrentHashMap.newKeySet();
-    private final Set<Integer> busyTaxis = ConcurrentHashMap.newKeySet();
-
     private final ReentrantLock taxiLock = new ReentrantLock();
+    private volatile Integer brokenTaxiId = null; // warunki -> jeden broken na raz
 
-    private volatile Integer brokenTaxiId = null; // tylko jedno taxi broken, to na wszelki
     private volatile boolean shuttingDownDyspozytornia = false;
 
     @Override
@@ -52,10 +46,10 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
             throw new IllegalStateException("Dyspozytornia is shutting down");
         }
         int id = zlecenieId.incrementAndGet();
-        Zlecenie zlecenie = new Zlecenie(id, 0, timeAdded.incrementAndGet());
+        Zlecenie zlecenie = new Zlecenie(id, 0, Instant.now());
         zlecenieQueue.offer(zlecenie);
 
-        tryReAssignZlecenie();
+        tryAssignZlecenie();
         return id;
     }
 
@@ -63,35 +57,37 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
     public void awaria(int numer, int numerZlecenia) {
         TaxiThread taxiThread = allTaxis.get(numer);
         if (taxiThread == null) throw new RuntimeException("Taxi thread not found");
-        if (taxiThread.getState() == TaxiState.BROKEN) throw new RuntimeException("Broken Taxi cannot be broken again");
-        if (brokenTaxiId != null) throw new RuntimeException("Two taxi cannot be broken at the same time");
+        if (taxiThread.getState() == TaxiState.BROKEN) throw new IllegalStateException("Broken Taxi cannot be broken again");
+        if (brokenTaxiId != null) throw new IllegalStateException("Two taxi cannot be broken at the same time");
 
         taxiThread.markTaxiAsBroken();
         brokenTaxiId = numer;
 
+        //dla bezpieństwa - gdy awaria taxi bez zadania
         taxiLock.lock();
         try {
-            busyTaxis.remove(numer);
+            availableTaxis.remove(numer);
         } finally {
             taxiLock.unlock();
         }
 
         Integer wasAssigned = assignedOrders.remove(numerZlecenia);
         if (wasAssigned == null) {
+            // edge case który nie jestem pewny czy powinien zostać obsłużony
             System.out.println("Zlecenie number: " + numerZlecenia + " wasn't assigned, only taxi will be marked as broken");
         } else {
-            Zlecenie zlecenie = new Zlecenie(numerZlecenia, 1, timeAdded.incrementAndGet());
+            Zlecenie zlecenie = new Zlecenie(numerZlecenia, 1, Instant.now());
             zlecenieQueue.offer(zlecenie);
         }
 
-        tryReAssignZlecenie();
+        tryAssignZlecenie();
     }
 
     @Override
     public void naprawiono(int numer) {
         TaxiThread taxiThread = allTaxis.get(numer);
-        if (taxiThread == null) throw new RuntimeException("Taxi thread not found");
-        if (taxiThread.getState() != TaxiState.BROKEN) throw new RuntimeException("Taxi not broken");
+        if (taxiThread == null) throw new IllegalStateException("Taxi thread not found");
+        if (taxiThread.getState() != TaxiState.BROKEN) throw new IllegalStateException("Taxi not broken");
 
         taxiThread.markTaxiAsRepaired();
         brokenTaxiId = null;
@@ -103,7 +99,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
             taxiLock.unlock();
         }
 
-        tryReAssignZlecenie();
+        tryAssignZlecenie();
     }
 
     @Override
@@ -126,8 +122,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         return shuttingDownDyspozytornia;
     }
 
-    //todo: do zmiany jak tylko BlockingQueue uzyjemy BlockingQueue<Integer> availableTaxis = new LinkedBlockingQueue<>();
-    private void tryReAssignZlecenie() {
+    private void tryAssignZlecenie() {
         if (shuttingDownDyspozytornia) return;
 
         taxiLock.lock();
@@ -138,7 +133,6 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
 
                 Integer taxiNumer = availableTaxis.iterator().next();
                 availableTaxis.remove(taxiNumer);
-                busyTaxis.add(taxiNumer);
 
                 TaxiThread taxiThread = allTaxis.get(taxiNumer);
                 if (taxiThread != null) {
@@ -151,7 +145,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         }
     }
 
-    void onTaxiFinished(int taxiNumer, int zlecenieId) {
+    void taxiAfterZlecenie(int taxiNumer, int zlecenieId) {
         if (shuttingDownDyspozytornia) return;
 
         assignedOrders.remove(zlecenieId);
@@ -160,14 +154,13 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         try {
             TaxiThread taxiThread = allTaxis.get(taxiNumer);
             if (taxiThread != null && taxiThread.getState() != TaxiState.BROKEN) {
-                busyTaxis.remove(taxiNumer);
                 availableTaxis.add(taxiNumer);
             }
         } finally {
             taxiLock.unlock();
         }
 
-        tryReAssignZlecenie(); // próbujemy przydzielić nowe
+        tryAssignZlecenie(); // próbujemy nowe zadanie dla taxi
     }
 }
 
@@ -181,9 +174,7 @@ class TaxiThread implements Runnable {
 
     private volatile TaxiState state = TaxiState.WAITING;
 
-    //todo : sprawdzenie czy to 2 pole jest niezbędne czy da się uprościć
     private volatile Zlecenie currentZlecenie = null;
-    private volatile boolean hasNewZlecenie = false;
 
     TaxiThread(Taxi taxi, DyspozytorniaWatkowa dyspozytornia) {
         this.taxi = taxi;
@@ -193,40 +184,10 @@ class TaxiThread implements Runnable {
     @Override
     public void run() {
         while (!dyspozytornia.isShuttingDownDyspozytornia()) {
-            Zlecenie zlecenieToDo = null;
+            // pobieramy zlecenie lub ustawiamy stan czekania na zlecenia albo naprawę awarii
+            Zlecenie zlecenieToDo = getOrWaitForZlecenie();
 
-            lock.lock();
-            try {
-                // czekamy jeśli broken
-                while (state == TaxiState.BROKEN && !dyspozytornia.isShuttingDownDyspozytornia()) {
-                    awariaCondition.await();
-                }
-
-                if (dyspozytornia.isShuttingDownDyspozytornia()) break;
-
-                // czekamy na nowe zlecenie
-                while (!hasNewZlecenie && !dyspozytornia.isShuttingDownDyspozytornia()) {
-                    noweZlecenieCondition.await();
-                }
-
-                if (dyspozytornia.isShuttingDownDyspozytornia()) break;
-
-                // bierzemy zlecenie
-                if (hasNewZlecenie && currentZlecenie != null) {
-                    zlecenieToDo = currentZlecenie;
-                    currentZlecenie = null;
-                    hasNewZlecenie = false;
-                    state = TaxiState.RUNNING;
-                }
-
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            } finally {
-                lock.unlock();
-            }
-
-            // wykonujemy zlecenie po za lock
+            // wykonujemy zlecenie, jeśl zostało przydzielone
             if (zlecenieToDo != null) {
                 int executedZlecenieId = zlecenieToDo.id();
                 try {
@@ -236,7 +197,7 @@ class TaxiThread implements Runnable {
                     try {
                         if (state != TaxiState.BROKEN && state == TaxiState.RUNNING) {
                             state = TaxiState.WAITING;
-                            dyspozytornia.onTaxiFinished(taxi.numer(), executedZlecenieId);
+                            dyspozytornia.taxiAfterZlecenie(taxi.numer(), executedZlecenieId);
                         }
                     } finally {
                         lock.unlock();
@@ -246,11 +207,42 @@ class TaxiThread implements Runnable {
         }
     }
 
+    private Zlecenie getOrWaitForZlecenie() {
+        lock.lock();
+        try {
+            while (state == TaxiState.BROKEN && !dyspozytornia.isShuttingDownDyspozytornia()) {
+                awariaCondition.await();
+            }
+
+            if (dyspozytornia.isShuttingDownDyspozytornia()) return null;
+
+            while (currentZlecenie == null && !dyspozytornia.isShuttingDownDyspozytornia()) {
+                noweZlecenieCondition.await();
+            }
+
+            if (dyspozytornia.isShuttingDownDyspozytornia()) return null;
+
+            if (currentZlecenie != null) {
+                Zlecenie zlecenieToDo = currentZlecenie;
+                currentZlecenie = null;
+                state = TaxiState.RUNNING;
+                return zlecenieToDo;
+            }
+
+            return null;
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     void assignZlecenie(Zlecenie zlecenie) {
         lock.lock();
         try {
             this.currentZlecenie = zlecenie;
-            this.hasNewZlecenie = true;
             noweZlecenieCondition.signal();
         } finally {
             lock.unlock();
@@ -280,17 +272,16 @@ class TaxiThread implements Runnable {
     void stop() {
         lock.lock();
         try {
-            awariaCondition.signalAll();
-            noweZlecenieCondition.signalAll();
+            awariaCondition.signal();
+            noweZlecenieCondition.signal();
         } finally {
             lock.unlock();
         }
     }
 
-    public TaxiState getState() {
-        return state;
-    }
+    public TaxiState getState() { return state; }
+
 }
 
-record Zlecenie(int id, int priority, long createdAt) {}
+record Zlecenie(int id, int priority, Instant createdAt) {}
 enum TaxiState { WAITING, RUNNING, BROKEN }

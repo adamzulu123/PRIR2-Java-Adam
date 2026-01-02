@@ -11,7 +11,7 @@ import java.util.concurrent.locks.ReentrantLock;
 public class DyspozytorniaWatkowa implements Dyspozytornia {
     private final AtomicInteger zlecenieId = new AtomicInteger(0);
 
-    //zlecenia -> ta kolejka ma wewnętrzny RenstrantLock
+    // Zlecenia
     Comparator<Zlecenie> zlecenieComparator = Comparator
             .comparing(Zlecenie::priority).reversed()
             .thenComparing(Zlecenie::createdAt);
@@ -24,7 +24,7 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
     private final ConcurrentHashMap<Integer, TaxiThread> allTaxis = new ConcurrentHashMap<>();
     private final Set<Integer> availableTaxis = ConcurrentHashMap.newKeySet();
     private final ReentrantLock taxiLock = new ReentrantLock();
-    private volatile Integer brokenTaxiId = null; // warunki -> jeden broken na raz
+    private Integer brokenTaxiId = null;
 
     private volatile boolean shuttingDownDyspozytornia = false;
 
@@ -58,14 +58,15 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         TaxiThread taxiThread = allTaxis.get(numer);
         if (taxiThread == null) throw new RuntimeException("Taxi thread not found");
         if (taxiThread.getState() == TaxiState.BROKEN) throw new IllegalStateException("Broken Taxi cannot be broken again");
-        if (brokenTaxiId != null) throw new IllegalStateException("Two taxi cannot be broken at the same time");
 
         taxiThread.markTaxiAsBroken();
-        brokenTaxiId = numer;
 
         //dla bezpieństwa - gdy awaria taxi bez zadania
         taxiLock.lock();
         try {
+            if (brokenTaxiId != null)
+                throw new IllegalStateException("Two taxi cannot be broken at the same time");
+            brokenTaxiId = numer;
             availableTaxis.remove(numer);
         } finally {
             taxiLock.unlock();
@@ -90,10 +91,10 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
         if (taxiThread.getState() != TaxiState.BROKEN) throw new IllegalStateException("Taxi not broken");
 
         taxiThread.markTaxiAsRepaired();
-        brokenTaxiId = null;
 
         taxiLock.lock();
         try {
+            brokenTaxiId = null;
             availableTaxis.add(numer);
         } finally {
             taxiLock.unlock();
@@ -280,7 +281,6 @@ class TaxiThread implements Runnable {
     }
 
     public TaxiState getState() { return state; }
-
 }
 
 record Zlecenie(int id, int priority, Instant createdAt) {}

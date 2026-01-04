@@ -53,52 +53,50 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
 
     @Override
     public void awaria(int numer, int numerZlecenia) {
+        TaxiThread taxiThread = allTaxis.get(numer);
+        if (taxiThread == null) return;
+
         taxiLock.lock();
         try {
-            TaxiThread taxiThread = allTaxis.get(numer);
-            if (taxiThread == null) throw new RuntimeException("Taxi thread not found");
-            if (taxiThread.getState() == TaxiState.BROKEN)
-                throw new IllegalStateException("Broken Taxi cannot be broken again");
-            if (brokenTaxiId != null)
-                throw new IllegalStateException("Two taxi cannot be broken at the same time");
+            if (taxiThread.getState() == TaxiState.BROKEN) return;
+            if (brokenTaxiId != null) return;
 
             Integer wasAssigned = assignedOrders.get(numerZlecenia);
-            if (wasAssigned == null) {
-                throw new IllegalArgumentException("Order: " + numerZlecenia + " - was not assigned to any taxi");
+
+            if (wasAssigned != null && wasAssigned.equals(numer)) {
+                assignedOrders.remove(numerZlecenia);
+                brokenTaxiId = numer;
+
+                Zlecenie zlecenie = new Zlecenie(numerZlecenia, 1, Instant.now());
+                zlecenieQueue.offer(zlecenie);
+            } else {
+                // podany numer zlecenia nie należy do danego Taxi
+                brokenTaxiId = numer;
             }
-            if (!wasAssigned.equals(numer)) {
-                throw new IllegalStateException("Order: " + numerZlecenia + " - was assigned to different taxi");
-            }
-
-            brokenTaxiId = numer;
-            assignedOrders.remove(numerZlecenia);
-
-            Zlecenie zlecenie = new Zlecenie(numerZlecenia, 1, Instant.now());
-            zlecenieQueue.offer(zlecenie);
-
-            taxiThread.markTaxiAsBroken();
-
         } finally {
             taxiLock.unlock();
         }
+
+        taxiThread.markTaxiAsBroken();
 
         tryAssignZlecenie();
     }
 
     @Override
     public void naprawiono(int numer) {
+        TaxiThread taxiThread = allTaxis.get(numer);
+        if (taxiThread == null) return;
+
         taxiLock.lock();
         try {
-            TaxiThread taxiThread = allTaxis.get(numer);
-            if (taxiThread == null) throw new IllegalStateException("Taxi thread not found");
-            if (taxiThread.getState() != TaxiState.BROKEN)
-                throw new IllegalStateException("Taxi not broken");
+            if (taxiThread.getState() != TaxiState.BROKEN) return;
 
             brokenTaxiId = null;
-            taxiThread.markTaxiAsRepaired();
         } finally {
             taxiLock.unlock();
         }
+
+        taxiThread.markTaxiAsRepaired();
 
         tryAssignZlecenie();
     }
@@ -126,14 +124,15 @@ public class DyspozytorniaWatkowa implements Dyspozytornia {
     private void tryAssignZlecenie() {
         if (shuttingDownDyspozytornia) return;
 
+        if (zlecenieQueue.isEmpty()) return;
+
         taxiLock.lock();
         try {
-            int skippingBrokenTaxi = 0; // aby uniknać nieskończonej pętli
+            int skippingBrokenTaxi = 0;
 
             while (!zlecenieQueue.isEmpty() && !availableTaxis.isEmpty()) {
                 Integer taxiNumer = availableTaxis.poll();
                 if (taxiNumer == null) break;
-                // jak zepsuta dodajemy ja na koniec kolejki
                 if (taxiNumer.equals(brokenTaxiId)) {
                     availableTaxis.offer(taxiNumer);
                     skippingBrokenTaxi++;

@@ -114,7 +114,7 @@ public class DyspozytorniaWatkowa2 implements Dyspozytornia {
         return restOfWork;
     }
 
-    public boolean isShuttingDownDyspozytornia() {
+    boolean isShuttingDownDyspozytornia() {
         return shuttingDownDyspozytornia;
     }
 
